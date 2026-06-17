@@ -49,9 +49,31 @@ try
     {
         KubernetesClientConfiguration config;
         if (KubernetesClientConfiguration.IsInCluster())
+        {
             config = KubernetesClientConfiguration.InClusterConfig();
+        }
         else
-            config = KubernetesClientConfiguration.BuildConfigFromConfigFile();
+        {
+            // In Development, prefer a kubectl-proxy URL (Kubernetes__ProxyUrl config or
+            // KUBERNETES__PROXYURL env var) to bypass Windows SChannel/kind cert issues.
+            // Start proxy with: kubectl proxy --port 8001
+            var proxyUrl = builder.Configuration["Kubernetes:ProxyUrl"];
+            if (!string.IsNullOrWhiteSpace(proxyUrl))
+            {
+                Log.Information("k8s: using kubectl-proxy at {Url}", proxyUrl);
+                config = new KubernetesClientConfiguration { Host = proxyUrl };
+            }
+            else
+            {
+                var kubeconfigPath = Environment.GetEnvironmentVariable("KUBECONFIG")
+                    ?? Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                        ".kube", "config");
+                config = KubernetesClientConfiguration.BuildConfigFromConfigFile(kubeconfigPath);
+                if (builder.Environment.IsDevelopment())
+                    config.SkipTlsVerify = true;
+            }
+        }
         return new Kubernetes(config);
     });
 
@@ -63,7 +85,10 @@ try
     builder.Services.AddHostedService<ReconciliationService>();
 
     // ── API / MVC ─────────────────────────────────────────────────────────────
-    builder.Services.AddControllers();
+    builder.Services.AddControllers()
+        .AddJsonOptions(opts =>
+            opts.JsonSerializerOptions.Converters.Add(
+                new System.Text.Json.Serialization.JsonStringEnumConverter()));
     builder.Services.AddEndpointsApiExplorer();
     builder.Services.AddSwaggerGen(c =>
     {
@@ -108,11 +133,16 @@ try
     // ── Build ─────────────────────────────────────────────────────────────────
     var app = builder.Build();
 
-    // Auto-migrate on startup
+    // Apply schema on startup:
+    // - Postgres: run migrations (proper version tracking, safe in production)
+    // - SQLite: EnsureCreated (avoids provider-specific migration type issues in dev/test)
     using (var scope = app.Services.CreateScope())
     {
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-        db.Database.Migrate();
+        if (dbProvider.Equals("postgres", StringComparison.OrdinalIgnoreCase))
+            db.Database.Migrate();
+        else
+            db.Database.EnsureCreated();
 
         // Bootstrap: create first admin project + key if no keys exist
         var projectSvc = scope.ServiceProvider.GetRequiredService<ProjectService>();

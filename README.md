@@ -126,10 +126,22 @@ curl -s -X DELETE http://localhost:8080/api/applications/hello-world \
 ## Running locally without Docker
 
 ```bash
-dotnet run --project DevLaunch.Api
+# 1. Start a local cluster (kind or minikube)
+kind create cluster --name devlaunch-local
+
+# 2. On Windows: start kubectl proxy to avoid SChannel/TLS issues with kind certs
+kubectl proxy --port 8001 &
+
+# 3. Start the API
+Kubernetes__ProxyUrl=http://localhost:8001 \
+  Database__Provider=postgres \
+  ConnectionStrings__Postgres="Host=localhost;Database=devlaunch;Username=devlaunch;Password=devlaunch" \
+  dotnet run --project DevLaunch.Api
 ```
 
-Falls back to SQLite (`DevLaunch.Api/data/devlaunch.db`) and discovers your local kubeconfig.
+Without `Kubernetes__ProxyUrl`, the API falls back to direct kubeconfig TLS — works on Linux/macOS, may fail on Windows with kind due to SChannel client-cert handling.
+
+Omitting `Database__Provider` falls back to SQLite (`DevLaunch.Api/data/devlaunch.db`).
 
 ## Running tests
 
@@ -166,10 +178,10 @@ Admin role is required for project management. Developer role is sufficient for 
 | GET | `/api/projects/{name}` | Admin | Get project details |
 | PUT | `/api/projects/{name}` | Admin | Update quotas |
 | DELETE | `/api/projects/{name}` | Admin | Delete project and namespace |
-| POST | `/api/projects/{name}/keys` | Admin | Create an API key |
-| GET | `/api/projects/{name}/keys` | Admin | List API keys |
-| DELETE | `/api/projects/{name}/keys/{id}` | Admin | Revoke an API key |
-| GET | `/api/projects/{name}/audit` | Developer | Audit log for this project |
+| POST | `/api/projects/{id}/api-keys` | Admin | Create an API key (role: "Admin" or "Developer") |
+| GET | `/api/projects/{id}/api-keys` | Admin | List API keys |
+| DELETE | `/api/projects/{id}/api-keys/{keyId}` | Admin | Revoke an API key |
+| GET | `/api/projects/{id}/audit` | Developer | Audit log for this project |
 
 ### Applications
 

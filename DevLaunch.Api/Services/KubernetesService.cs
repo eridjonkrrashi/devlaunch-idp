@@ -257,8 +257,9 @@ public class KubernetesService(IKubernetes k8s, ILogger<KubernetesService> logge
             await k8s.CoreV1.ListNamespaceAsync(cancellationToken: ct);
             return true;
         }
-        catch
+        catch (Exception ex)
         {
+            logger.LogDebug(ex, "Kubernetes cluster not reachable: {Message}", ex.Message);
             return false;
         }
     }
