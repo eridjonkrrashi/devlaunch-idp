@@ -1,0 +1,11 @@
+**/.vs
+**/.vscode
+**/.idea
+**/bin
+**/obj
+**/*.user
+**/data/
+**/node_modules
+frontend/dist
+.git
+.gitignore

@@ -1,0 +1,40 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      Database__Provider: postgres
+      ConnectionStrings__Postgres: "Host=postgres;Database=devlaunch;Username=devlaunch;Password=${POSTGRES_PASSWORD:-devlaunch}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      # Mount your local kubeconfig so the API can reach your cluster
+      # TODO(eridjon): set KUBECONFIG or mount ~/.kube/config for cluster access
+      - "${KUBECONFIG:-${HOME}/.kube/config}:/root/.kube/config:ro"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: devlaunch
+      POSTGRES_USER: devlaunch
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-devlaunch}"
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U devlaunch -d devlaunch"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:
