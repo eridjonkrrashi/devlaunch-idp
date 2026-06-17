@@ -6,9 +6,8 @@ using Prometheus;
 namespace DevLaunch.Api.Services;
 
 /// <summary>
-/// Periodic background loop that syncs each app's Status with live cluster state.
-/// Degrades safely when the cluster is unreachable — marks apps as Degraded but
-/// keeps the API responsive. Never throws; logs and continues on any error.
+/// Periodic background loop: syncs status from cluster, checks rollout progress,
+/// triggers auto-rollback on failed rollouts. Degrades gracefully when cluster is unreachable.
 /// </summary>
 public class ReconciliationService(
     IServiceScopeFactory scopeFactory,
@@ -16,8 +15,11 @@ public class ReconciliationService(
 {
     private static readonly Counter ReconcileErrors = Metrics.CreateCounter(
         "devlaunch_reconcile_errors_total", "Total reconciliation errors");
+    private static readonly Gauge ReconcileLastRunAge = Metrics.CreateGauge(
+        "devlaunch_reconcile_last_run_seconds_ago", "Seconds since last successful reconcile");
 
     private static readonly TimeSpan Interval = TimeSpan.FromSeconds(30);
+    private DateTime _lastSuccessfulRun = DateTime.UtcNow;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -25,6 +27,7 @@ public class ReconciliationService(
 
         while (!stoppingToken.IsCancellationRequested)
         {
+            ReconcileLastRunAge.Set((DateTime.UtcNow - _lastSuccessfulRun).TotalSeconds);
             await ReconcileAllAsync(stoppingToken);
             await Task.Delay(Interval, stoppingToken).ConfigureAwait(false);
         }
@@ -37,6 +40,7 @@ public class ReconciliationService(
             using var scope = scopeFactory.CreateScope();
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
             var k8s = scope.ServiceProvider.GetRequiredService<IKubernetesService>();
+            var appService = scope.ServiceProvider.GetRequiredService<ApplicationService>();
 
             var reachable = await k8s.IsReachableAsync(ct);
             if (!reachable)
@@ -53,10 +57,7 @@ public class ReconciliationService(
 
             foreach (var app in apps)
             {
-                try
-                {
-                    await ReconcileAppAsync(app, k8s, db, ct);
-                }
+                try { await ReconcileAppAsync(app, appService, k8s, ct); }
                 catch (Exception ex)
                 {
                     logger.LogWarning(ex, "Reconcile failed for {Name}", app.Name);
@@ -65,8 +66,9 @@ public class ReconciliationService(
             }
 
             await db.SaveChangesAsync(ct);
+            _lastSuccessfulRun = DateTime.UtcNow;
         }
-        catch (OperationCanceledException) { /* shutting down */ }
+        catch (OperationCanceledException) { }
         catch (Exception ex)
         {
             logger.LogError(ex, "Unexpected error in reconciliation loop");
@@ -75,8 +77,13 @@ public class ReconciliationService(
     }
 
     private static async Task ReconcileAppAsync(
-        Models.Application app, IKubernetesService k8s, AppDbContext db, CancellationToken ct)
+        Models.Application app, ApplicationService appService, IKubernetesService k8s, CancellationToken ct)
     {
+        // Check rollout progress (may trigger auto-rollback)
+        await appService.CheckRolloutAsync(app, ct);
+
+        if (app.RolloutPhase == RolloutPhase.InProgress) return; // status managed by rollout checker
+
         var live = await k8s.GetLiveStatusAsync(app.Name, app.Namespace, ct);
         if (live is null)
         {
@@ -87,12 +94,13 @@ public class ReconciliationService(
         {
             app.Status = DeriveStatus(live.ReadyReplicas, live.TotalReplicas, app.Replicas);
         }
+
         app.UpdatedAt = DateTime.UtcNow;
     }
 
     private static ApplicationStatus DeriveStatus(int ready, int total, int desired)
     {
-        if (ready == desired && total == desired) return ApplicationStatus.Running;
+        if (ready >= desired && total >= desired) return ApplicationStatus.Running;
         if (ready == 0) return ApplicationStatus.Failed;
         return ApplicationStatus.Degraded;
     }

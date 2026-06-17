@@ -39,6 +39,18 @@ public class ApplicationSpec
 
     [MaxLength(256)]
     public string? IngressHost { get; set; }
+
+    // Horizontal Pod Autoscaler
+    public bool HpaEnabled { get; set; }
+
+    [Range(1, 50)]
+    public int HpaMinReplicas { get; set; } = 1;
+
+    [Range(1, 50)]
+    public int HpaMaxReplicas { get; set; } = 10;
+
+    [Range(1, 100)]
+    public int HpaCpuTargetPercent { get; set; } = 80;
 }
 
 public class EnvVarDto
@@ -68,6 +80,8 @@ public class ApplicationSummaryDto
     public int Port { get; set; }
     public int Replicas { get; set; }
     public string Status { get; set; } = string.Empty;
+    public string RolloutPhase { get; set; } = string.Empty;
+    public string? RolloutMessage { get; set; }
     public int CurrentRevision { get; set; }
     public DateTime CreatedAt { get; set; }
     public DateTime UpdatedAt { get; set; }
@@ -82,6 +96,11 @@ public class ApplicationDetailDto : ApplicationSummaryDto
     public string MemoryRequest { get; set; } = string.Empty;
     public string MemoryLimit { get; set; } = string.Empty;
     public string? IngressHost { get; set; }
+    public bool HpaEnabled { get; set; }
+    public int HpaMinReplicas { get; set; }
+    public int HpaMaxReplicas { get; set; }
+    public int HpaCpuTargetPercent { get; set; }
+    public HpaStatusDto? HpaStatus { get; set; }
     public List<RevisionDto> Revisions { get; set; } = [];
 }
 
@@ -102,6 +121,14 @@ public class LiveStatusDto
     public List<string> Conditions { get; set; } = [];
 }
 
+public class HpaStatusDto
+{
+    public int CurrentReplicas { get; set; }
+    public int DesiredReplicas { get; set; }
+    public int? CurrentCpuPercent { get; set; }
+    public int TargetCpuPercent { get; set; }
+}
+
 public class PodStatusDto
 {
     public string Name { get; set; } = string.Empty;
@@ -114,4 +141,5 @@ public class ApiError
 {
     public string Error { get; set; } = string.Empty;
     public string? Details { get; set; }
+    public string? CorrelationId { get; set; }
 }

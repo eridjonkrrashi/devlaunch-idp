@@ -2,7 +2,6 @@ using DevLaunch.Api.DTOs;
 using DevLaunch.Api.Models;
 using k8s;
 using k8s.Models;
-using Microsoft.Extensions.Logging;
 
 namespace DevLaunch.Api.Services;
 
@@ -15,11 +14,18 @@ public class KubernetesService(IKubernetes k8s, ILogger<KubernetesService> logge
     private const string ManagedByLabel = "devlaunch";
     private const string AppNameLabel = "app.kubernetes.io/name";
     private const string ManagedByLabelKey = "app.kubernetes.io/managed-by";
+    private const string ProjectLabel = "devlaunch.io/project";
+
+    // ── Application lifecycle ─────────────────────────────────────────────────
 
     public async Task ApplyApplicationAsync(Models.Application app, CancellationToken ct = default)
     {
         await ApplyDeploymentAsync(app, ct);
         await ApplyServiceAsync(app, ct);
+        if (app.HpaEnabled)
+            await ApplyHpaAsync(app, ct);
+        else
+            await TryDeleteAsync(() => k8s.AutoscalingV1.DeleteNamespacedHorizontalPodAutoscalerAsync(app.Name, app.Namespace, cancellationToken: ct), $"HPA/{app.Name}");
         if (!string.IsNullOrWhiteSpace(app.IngressHost))
             await ApplyIngressAsync(app, ct);
     }
@@ -28,8 +34,11 @@ public class KubernetesService(IKubernetes k8s, ILogger<KubernetesService> logge
     {
         await TryDeleteAsync(() => k8s.AppsV1.DeleteNamespacedDeploymentAsync(name, ns, cancellationToken: ct), $"Deployment/{name}");
         await TryDeleteAsync(() => k8s.CoreV1.DeleteNamespacedServiceAsync(name, ns, cancellationToken: ct), $"Service/{name}");
+        await TryDeleteAsync(() => k8s.AutoscalingV1.DeleteNamespacedHorizontalPodAutoscalerAsync(name, ns, cancellationToken: ct), $"HPA/{name}");
         await TryDeleteAsync(() => k8s.NetworkingV1.DeleteNamespacedIngressAsync(name, ns, cancellationToken: ct), $"Ingress/{name}");
     }
+
+    // ── Status + observability ────────────────────────────────────────────────
 
     public async Task<LiveStatusDto?> GetLiveStatusAsync(string name, string ns, CancellationToken ct = default)
     {
@@ -62,6 +71,25 @@ public class KubernetesService(IKubernetes k8s, ILogger<KubernetesService> logge
         catch (Exception ex)
         {
             logger.LogWarning("Could not fetch live status for {Name}/{Ns}: {Msg}", name, ns, ex.Message);
+            return null;
+        }
+    }
+
+    public async Task<HpaStatusDto?> GetHpaStatusAsync(string name, string ns, CancellationToken ct = default)
+    {
+        try
+        {
+            var hpa = await k8s.AutoscalingV1.ReadNamespacedHorizontalPodAutoscalerAsync(name, ns, cancellationToken: ct);
+            return new HpaStatusDto
+            {
+                CurrentReplicas = hpa.Status?.CurrentReplicas ?? 0,
+                DesiredReplicas = hpa.Status?.DesiredReplicas ?? 0,
+                CurrentCpuPercent = hpa.Status?.CurrentCPUUtilizationPercentage,
+                TargetCpuPercent = hpa.Spec?.TargetCPUUtilizationPercentage ?? 80
+            };
+        }
+        catch
+        {
             return null;
         }
     }
@@ -111,6 +139,117 @@ public class KubernetesService(IKubernetes k8s, ILogger<KubernetesService> logge
         }
     }
 
+    // ── Namespace + quota management ──────────────────────────────────────────
+
+    public async Task EnsureNamespaceAsync(string ns, CancellationToken ct = default)
+    {
+        try
+        {
+            await k8s.CoreV1.ReadNamespaceAsync(ns, cancellationToken: ct);
+            logger.LogDebug("Namespace {Ns} already exists", ns);
+        }
+        catch (k8s.Autorest.HttpOperationException ex) when (ex.Response.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            await k8s.CoreV1.CreateNamespaceAsync(new V1Namespace
+            {
+                Metadata = new V1ObjectMeta
+                {
+                    Name = ns,
+                    Labels = new Dictionary<string, string> { [ManagedByLabelKey] = ManagedByLabel }
+                }
+            }, cancellationToken: ct);
+            logger.LogInformation("Created namespace {Ns}", ns);
+        }
+    }
+
+    public async Task DeleteNamespaceAsync(string ns, CancellationToken ct = default)
+    {
+        await TryDeleteAsync(() => k8s.CoreV1.DeleteNamespaceAsync(ns, cancellationToken: ct), $"Namespace/{ns}");
+    }
+
+    public async Task ApplyResourceQuotaAsync(string ns, string cpuQuota, string memoryQuota, CancellationToken ct = default)
+    {
+        var quota = new V1ResourceQuota
+        {
+            Metadata = new V1ObjectMeta
+            {
+                Name = "devlaunch-quota",
+                NamespaceProperty = ns,
+                Labels = new Dictionary<string, string> { [ManagedByLabelKey] = ManagedByLabel }
+            },
+            Spec = new V1ResourceQuotaSpec
+            {
+                Hard = new Dictionary<string, ResourceQuantity>
+                {
+                    ["requests.cpu"] = new ResourceQuantity(cpuQuota),
+                    ["requests.memory"] = new ResourceQuantity(memoryQuota),
+                    ["limits.cpu"] = new ResourceQuantity(cpuQuota),
+                    ["limits.memory"] = new ResourceQuantity(memoryQuota)
+                }
+            }
+        };
+
+        try
+        {
+            await k8s.CoreV1.ReadNamespacedResourceQuotaAsync("devlaunch-quota", ns, cancellationToken: ct);
+            await k8s.CoreV1.ReplaceNamespacedResourceQuotaAsync(quota, "devlaunch-quota", ns, cancellationToken: ct);
+        }
+        catch (k8s.Autorest.HttpOperationException ex) when (ex.Response.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            await k8s.CoreV1.CreateNamespacedResourceQuotaAsync(quota, ns, cancellationToken: ct);
+        }
+
+        logger.LogInformation("Applied ResourceQuota cpu={Cpu} mem={Mem} to {Ns}", cpuQuota, memoryQuota, ns);
+    }
+
+    public async Task ApplyLimitRangeAsync(string ns, CancellationToken ct = default)
+    {
+        var lr = new V1LimitRange
+        {
+            Metadata = new V1ObjectMeta
+            {
+                Name = "devlaunch-limits",
+                NamespaceProperty = ns,
+                Labels = new Dictionary<string, string> { [ManagedByLabelKey] = ManagedByLabel }
+            },
+            Spec = new V1LimitRangeSpec
+            {
+                Limits =
+                [
+                    new V1LimitRangeItem
+                    {
+                        Type = "Container",
+                        DefaultProperty = new Dictionary<string, ResourceQuantity>
+                        {
+                            ["cpu"] = new ResourceQuantity("500m"),
+                            ["memory"] = new ResourceQuantity("512Mi")
+                        },
+                        DefaultRequest = new Dictionary<string, ResourceQuantity>
+                        {
+                            ["cpu"] = new ResourceQuantity("100m"),
+                            ["memory"] = new ResourceQuantity("128Mi")
+                        },
+                        Max = new Dictionary<string, ResourceQuantity>
+                        {
+                            ["cpu"] = new ResourceQuantity("4"),
+                            ["memory"] = new ResourceQuantity("4Gi")
+                        }
+                    }
+                ]
+            }
+        };
+
+        try
+        {
+            await k8s.CoreV1.ReadNamespacedLimitRangeAsync("devlaunch-limits", ns, cancellationToken: ct);
+            await k8s.CoreV1.ReplaceNamespacedLimitRangeAsync(lr, "devlaunch-limits", ns, cancellationToken: ct);
+        }
+        catch (k8s.Autorest.HttpOperationException ex) when (ex.Response.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            await k8s.CoreV1.CreateNamespacedLimitRangeAsync(lr, ns, cancellationToken: ct);
+        }
+    }
+
     public async Task<bool> IsReachableAsync(CancellationToken ct = default)
     {
         try
@@ -124,27 +263,27 @@ public class KubernetesService(IKubernetes k8s, ILogger<KubernetesService> logge
         }
     }
 
-    // ── Manifest builders (internal so tests can verify the generated objects) ─
+    // ── Manifest builders (internal so tests can verify generated objects) ────
 
-    internal static Dictionary<string, string> BuildLabels(string name) => new()
+    internal static Dictionary<string, string> BuildLabels(string name, string? projectName = null)
     {
-        [AppNameLabel] = name,
-        [ManagedByLabelKey] = ManagedByLabel
-    };
+        var labels = new Dictionary<string, string>
+        {
+            [AppNameLabel] = name,
+            [ManagedByLabelKey] = ManagedByLabel
+        };
+        if (projectName is not null) labels[ProjectLabel] = projectName;
+        return labels;
+    }
 
     internal static V1Deployment BuildDeployment(Models.Application app)
     {
-        var labels = BuildLabels(app.Name);
+        var labels = BuildLabels(app.Name, app.Project?.Name);
         var envVars = app.EnvVars.Select(e => new V1EnvVar(e.Key, e.Value)).ToList();
 
         return new V1Deployment
         {
-            Metadata = new V1ObjectMeta
-            {
-                Name = app.Name,
-                NamespaceProperty = app.Namespace,
-                Labels = labels
-            },
+            Metadata = new V1ObjectMeta { Name = app.Name, NamespaceProperty = app.Namespace, Labels = labels },
             Spec = new V1DeploymentSpec
             {
                 Replicas = app.Replicas,
@@ -157,6 +296,7 @@ public class KubernetesService(IKubernetes k8s, ILogger<KubernetesService> logge
                     Metadata = new V1ObjectMeta { Labels = labels },
                     Spec = new V1PodSpec
                     {
+                        SecurityContext = new V1PodSecurityContext { RunAsNonRoot = true },
                         Containers =
                         [
                             new V1Container
@@ -182,13 +322,21 @@ public class KubernetesService(IKubernetes k8s, ILogger<KubernetesService> logge
                                 {
                                     HttpGet = new V1HTTPGetAction { Path = "/health", Port = app.Port },
                                     InitialDelaySeconds = 15,
-                                    PeriodSeconds = 20
+                                    PeriodSeconds = 20,
+                                    FailureThreshold = 3
                                 },
                                 ReadinessProbe = new V1Probe
                                 {
                                     HttpGet = new V1HTTPGetAction { Path = "/ready", Port = app.Port },
                                     InitialDelaySeconds = 5,
-                                    PeriodSeconds = 10
+                                    PeriodSeconds = 10,
+                                    FailureThreshold = 3
+                                },
+                                SecurityContext = new V1SecurityContext
+                                {
+                                    AllowPrivilegeEscalation = false,
+                                    ReadOnlyRootFilesystem = false, // apps may need writable fs
+                                    RunAsNonRoot = true
                                 }
                             }
                         ]
@@ -200,15 +348,10 @@ public class KubernetesService(IKubernetes k8s, ILogger<KubernetesService> logge
 
     internal static V1Service BuildService(Models.Application app)
     {
-        var labels = BuildLabels(app.Name);
+        var labels = BuildLabels(app.Name, app.Project?.Name);
         return new V1Service
         {
-            Metadata = new V1ObjectMeta
-            {
-                Name = app.Name,
-                NamespaceProperty = app.Namespace,
-                Labels = labels
-            },
+            Metadata = new V1ObjectMeta { Name = app.Name, NamespaceProperty = app.Namespace, Labels = labels },
             Spec = new V1ServiceSpec
             {
                 Selector = new Dictionary<string, string> { [AppNameLabel] = app.Name },
@@ -218,9 +361,30 @@ public class KubernetesService(IKubernetes k8s, ILogger<KubernetesService> logge
         };
     }
 
+    internal static V1HorizontalPodAutoscaler BuildHpa(Models.Application app)
+    {
+        var labels = BuildLabels(app.Name, app.Project?.Name);
+        return new V1HorizontalPodAutoscaler
+        {
+            Metadata = new V1ObjectMeta { Name = app.Name, NamespaceProperty = app.Namespace, Labels = labels },
+            Spec = new V1HorizontalPodAutoscalerSpec
+            {
+                ScaleTargetRef = new V1CrossVersionObjectReference
+                {
+                    ApiVersion = "apps/v1",
+                    Kind = "Deployment",
+                    Name = app.Name
+                },
+                MinReplicas = app.HpaMinReplicas,
+                MaxReplicas = app.HpaMaxReplicas,
+                TargetCPUUtilizationPercentage = app.HpaCpuTargetPercent
+            }
+        };
+    }
+
     internal static V1Ingress BuildIngress(Models.Application app)
     {
-        var labels = BuildLabels(app.Name);
+        var labels = BuildLabels(app.Name, app.Project?.Name);
         return new V1Ingress
         {
             Metadata = new V1ObjectMeta
@@ -295,6 +459,22 @@ public class KubernetesService(IKubernetes k8s, ILogger<KubernetesService> logge
         {
             await k8s.CoreV1.CreateNamespacedServiceAsync(svc, app.Namespace, cancellationToken: ct);
         }
+    }
+
+    private async Task ApplyHpaAsync(Models.Application app, CancellationToken ct)
+    {
+        var hpa = BuildHpa(app);
+        try
+        {
+            await k8s.AutoscalingV1.ReadNamespacedHorizontalPodAutoscalerAsync(app.Name, app.Namespace, cancellationToken: ct);
+            await k8s.AutoscalingV1.ReplaceNamespacedHorizontalPodAutoscalerAsync(hpa, app.Name, app.Namespace, cancellationToken: ct);
+        }
+        catch (k8s.Autorest.HttpOperationException ex) when (ex.Response.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            await k8s.AutoscalingV1.CreateNamespacedHorizontalPodAutoscalerAsync(hpa, app.Namespace, cancellationToken: ct);
+        }
+
+        logger.LogInformation("Applied HPA {Name} in {Ns} (min={Min} max={Max} cpu={Cpu}%)", app.Name, app.Namespace, app.HpaMinReplicas, app.HpaMaxReplicas, app.HpaCpuTargetPercent);
     }
 
     private async Task ApplyIngressAsync(Models.Application app, CancellationToken ct)

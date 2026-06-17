@@ -6,6 +6,10 @@ public class Application
 {
     public Guid Id { get; set; } = Guid.NewGuid();
 
+    // Project ownership
+    public Guid ProjectId { get; set; }
+    public Project? Project { get; set; }
+
     [Required, MaxLength(63)]
     public string Name { get; set; } = string.Empty;
 
@@ -40,6 +44,18 @@ public class Application
 
     public int CurrentRevision { get; set; } = 1;
 
+    // Rollout tracking
+    public RolloutPhase RolloutPhase { get; set; } = RolloutPhase.Unknown;
+    public DateTime? RolloutStartedAt { get; set; }
+    [MaxLength(512)]
+    public string? RolloutMessage { get; set; }
+
+    // Horizontal Pod Autoscaler
+    public bool HpaEnabled { get; set; }
+    public int HpaMinReplicas { get; set; } = 1;
+    public int HpaMaxReplicas { get; set; } = 10;
+    public int HpaCpuTargetPercent { get; set; } = 80;
+
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 
     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
@@ -55,6 +71,14 @@ public enum ApplicationStatus
     Degraded,
     Failed,
     Deleting
+}
+
+public enum RolloutPhase
+{
+    Unknown,
+    InProgress,
+    Complete,
+    Failed
 }
 
 public class EnvVar
