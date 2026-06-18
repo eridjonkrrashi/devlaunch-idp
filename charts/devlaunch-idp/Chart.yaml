@@ -1,0 +1,12 @@
+apiVersion: v2
+name: devlaunch-idp
+description: DevLaunch Internal Developer Platform — self-service Kubernetes app management API + UI
+type: application
+version: 1.1.0
+appVersion: "1.1.0"
+keywords:
+  - idp
+  - kubernetes
+  - developer-platform
+maintainers:
+  - name: eridjon973

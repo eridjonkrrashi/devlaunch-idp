@@ -1,0 +1,52 @@
+image:
+  repository: ghcr.io/eridjonkrrashi/devlaunch-idp
+  tag: latest
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+ingress:
+  enabled: false
+  className: nginx
+  host: idp.example.com
+  tls: false
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+database:
+  # "sqlite" or "postgres"
+  provider: postgres
+  # Used when provider=postgres
+  postgresConnectionString: "Host=postgres;Port=5432;Database=devlaunch;Username=devlaunch;Password=changeme"
+
+kubernetes:
+  # Leave empty to use in-cluster ServiceAccount
+  proxyUrl: ""
+  # Set to "true" in development only
+  skipTlsVerify: "false"
+
+postgres:
+  # Set to true to deploy a bundled Postgres (not for production)
+  enabled: true
+  image: postgres:16-alpine
+  password: changeme
+  storage: 5Gi
+
+serviceAccount:
+  create: true
+  name: devlaunch-idp
+
+# RBAC: ClusterRole giving the API the permissions it needs to manage workloads
+rbac:
+  create: true
